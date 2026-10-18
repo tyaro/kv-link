@@ -5,18 +5,35 @@
 //! 障害を注入できる（[`Fault`]: エラーコード・遅延・分割送信・ゴミ・終端後の
 //! 余分なバイト・無応答・切断）。
 //!
-//! **限界**: このモックは `protocol.rs` と同じ（未照合の）前提から作っている
-//! ので、プロトコルの思い違いはモックでは見つからない。モックで確かめられる
-//! のはクライアントの振る舞い（分割受信・毒化・エラー分類）まで。プロトコルの
-//! 正しさは公式マニュアルとの照合と実機で確かめる（docs/protocol.md）。
+//! マニュアル（KV-XLE02 UM 13 章、docs/protocol.md）に合わせてあるもの:
+//!
+//! - デバイス範囲（`DM`/`EM` 0〜65534、`R` 〜199915、`MR` 〜399915、`LR` 〜99915）。
+//!   範囲外の番号と、範囲の端を超える連続アクセス（32 bit の 2 ワード目を含む）は
+//!   `E0`。
+//! - 点数上限（ビット・16 bit 1〜1000、32 bit 1〜500）。上限外は `E1`（モックの
+//!   割り当て、下記）。上限があるので巨大な点数で大きな確保をしない。
+//! - 固定幅の応答（`.U` 5・`.S` 6・`.D` 10・`.L` 11・`.H` 4・ビット 1 バイト、
+//!   符号付きは常に `+`/`-`）。マニュアルの例どおり `RDS DM200.S 3` →
+//!   `+15025 -25400 +00000`、`RDS R100 4` → `1 0 1 0`。
+//! - 書き込みデータのゼロサプレスと、正の数の `+` の有無のどちらも受け付ける。
+//!   デバイス番号・点数のゼロサプレス（`DM00200`・`0003`）も受け付ける。
+//! - ワード機器で形式を省くと `.U`。32 bit は指定番号が下位ワード、次が上位ワード。
+//!   奇数番地の 32 bit も受け付ける（PLC も受け付ける。同時性が無いだけ）。
+//! - コマンドの区切りは CR。CR LF で送られた場合の LF は捨てる。
+//!
+//! `E4`（書き込み禁止）・`E5` などの PLC の状態に依るエラーは、[`Fault::ErrorCode`]
+//! で注入する。
+//!
+//! **限界**: このモックはマニュアルを読んだ同じ人の理解から作っているので、
+//! 読み違いはモックでは見つからない。また実機で確かめた事実は 1 つもない
+//! （docs/protocol.md「実機確認」）。モックで確かめられるのはクライアントの
+//! 振る舞い（分割受信・毒化・エラー分類・送る前の検査）まで。ビットデバイスを
+//! `.U` などのワード形式で読み書きする要求（プロトコル上は可）は実装しておらず
+//! `E0` を返す（ライブラリはその要求を送らない）。
 //!
 //! 接続数・要求数・受信したコマンドの記録（[`MockServer::connection_count`]
 //! など）は、利用側（banto-industrial #438）が「全シミュレーション運転では
 //! 実機向けの接続・要求が 1 つも出ていない」ことを確かめるためにも使う。
-//!
-//! 応答の書式（ゼロ詰め・符号）はモックの選択で、実機の書式は未照合
-//! （docs/protocol.md P-08）。クライアントの解析が詰め物の有無どちらも
-//! 受け付けることを確かめるため、あえて詰め物ありで返す。
 //!
 //! ```
 //! # #[tokio::main(flavor = "current_thread")]
@@ -280,8 +297,10 @@ async fn respond(
 
 /// コマンド 1 行を実行し、応答の本文（終端なし）を返す。
 ///
-/// エラーの割り当て（文法違反 = `E1`、アドレス違反 = `E0`、値の範囲外 = `E1`）は
-/// モックの選択で、実機がどう返すかは未照合。
+/// エラーの割り当て: 範囲外のデバイス番号・範囲の端を超える連続アクセス = `E0`
+/// （マニュアルの `E0` の説明どおり）。未知のコマンド・要素の数の違い = `E1`
+/// （同じく `E1`）。点数の上限外・書込個数と値の数の不一致・値の範囲外 = `E1` は
+/// モックの選択で、実機がどちらを返すかはマニュアルに書かれていない。
 fn execute(s: &mut State, line: &str) -> String {
     let e_cmd = || protocol::ERR_COMMAND.to_owned();
     let e_dev = || protocol::ERR_DEVICE_NUMBER.to_owned();
@@ -296,7 +315,16 @@ fn execute(s: &mut State, line: &str) -> String {
         return e_dev();
     };
     let rest: Vec<&str> = tokens.collect();
-    let parse_count = |t: &str| t.parse::<u32>().ok().filter(|n| *n > 0);
+    // 点数はゼロサプレスしてよい（`0003` も `3` も可）。上限は形式ごと（P-25）。
+    let max_points = fmt.map_or(protocol::MAX_POINTS_16BIT, DataFormat::max_points);
+    let parse_count = |t: &str| {
+        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        t.parse::<u32>()
+            .ok()
+            .filter(|n| (1..=max_points).contains(&(*n as usize)))
+    };
 
     match cmd.to_ascii_uppercase().as_str() {
         c if c == protocol::CMD_READ && rest.is_empty() => {
@@ -322,7 +350,7 @@ fn execute(s: &mut State, line: &str) -> String {
 }
 
 /// `DM100.U` → (アドレス, 形式)。ビットデバイスは形式なし、ワードデバイスは
-/// 形式なしなら `.U` とみなす（実機の既定形式は未照合、docs/protocol.md P-14）。
+/// 形式なしなら `.U`（docs/protocol.md P-14）。
 fn parse_operand(operand: &str) -> Option<(Address, Option<DataFormat>)> {
     let (dev, fmt) = match operand.split_once(protocol::FORMAT_DELIMITER) {
         Some((d, f)) => (d, Some(DataFormat::from_suffix(f)?)),
@@ -336,8 +364,8 @@ fn parse_operand(operand: &str) -> Option<(Address, Option<DataFormat>)> {
     }
 }
 
-/// 32 bit 形式の 2 ワードの並び（下位ワードが先）はモックの仮定で、実機は
-/// 未照合（docs/protocol.md P-12、ワード順は P-26 で保留中）。
+/// 32 bit 形式は指定番号が下位ワード、次の番号が上位ワード（docs/protocol.md
+/// P-12）。応答は形式ごとの固定幅（P-08）。`n` は呼び出し側で点数上限を検査済み。
 fn read_points(s: &State, addr: &Address, fmt: Option<DataFormat>, n: u32) -> Option<String> {
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -454,5 +482,83 @@ mod tests {
         assert_eq!(run(&mut s, "WR DM0.U 65536"), "E1");
         assert_eq!(run(&mut s, "WRS DM0.U 2 1"), "E1");
         assert_eq!(run(&mut s, "RDS DM0.U 0"), "E1");
+        assert_eq!(run(&mut s, "RDS DM0.U +1"), "E1");
+    }
+
+    #[test]
+    fn manual_examples() {
+        let mut s = State::default();
+        // WRS DM200.S 3 +15025 -05400 200 → OK（13-21〜13-23）。
+        assert_eq!(run(&mut s, "WRS DM200.S 3 +15025 -05400 200"), "OK");
+        assert_eq!(run(&mut s, "RDS DM200.S 3"), "+15025 -05400 +00200");
+        assert_eq!(run(&mut s, "WRS DM200.S 3 +15025 -25400 0"), "OK");
+        // RDS DM200.S 3 → +15025 -25400 +00000（13-17〜13-20）。
+        assert_eq!(run(&mut s, "RDS DM200.S 3"), "+15025 -25400 +00000");
+        // WRS R100 4 1 0 1 0 → OK、RDS R100 4 → 1 0 1 0。
+        assert_eq!(run(&mut s, "WRS R100 4 1 0 1 0"), "OK");
+        assert_eq!(run(&mut s, "RDS R100 4"), "1 0 1 0");
+        // ゼロサプレスしないデバイス番号・点数も同じ。
+        assert_eq!(run(&mut s, "RDS DM00200.S 0003"), "+15025 -25400 +00000");
+    }
+
+    #[test]
+    fn fixed_width_responses() {
+        let mut s = State::default();
+        assert_eq!(run(&mut s, "RD DM0.U"), "00000");
+        assert_eq!(run(&mut s, "RD DM0.S"), "+00000");
+        assert_eq!(run(&mut s, "RD DM0.D"), "0000000000");
+        assert_eq!(run(&mut s, "RD DM0.L"), "+0000000000");
+        assert_eq!(run(&mut s, "RD DM0.H"), "0000");
+        assert_eq!(run(&mut s, "WR DM0.D 4294967295"), "OK");
+        assert_eq!(run(&mut s, "RD DM0.D"), "4294967295");
+        assert_eq!(run(&mut s, "RD DM0.L"), "-0000000001");
+        assert_eq!(run(&mut s, "RD DM0.H"), "FFFF");
+        // 下位ワードが指定番号、上位ワードが次の番号。
+        assert_eq!(run(&mut s, "WR DM10.D 65536"), "OK");
+        assert_eq!(run(&mut s, "RD DM10.U"), "00000");
+        assert_eq!(run(&mut s, "RD DM11.U"), "00001");
+        // 奇数番地の 32 bit も PLC は受け付ける（同時性が無いだけ）。
+        assert_eq!(run(&mut s, "RD DM11.D"), "0000000001");
+    }
+
+    #[test]
+    fn ranges_and_point_limits() {
+        let mut s = State::default();
+        assert_eq!(run(&mut s, "RD DM65534"), "00000");
+        assert_eq!(run(&mut s, "RD DM65535"), "E0");
+        assert_eq!(run(&mut s, "RD EM65535.U"), "E0");
+        assert_eq!(run(&mut s, "RD DM65534.D"), "E0");
+        assert_eq!(run(&mut s, "RDS DM65533.U 2"), "00000 00000");
+        assert_eq!(run(&mut s, "RDS DM65533.U 3"), "E0");
+        assert_eq!(run(&mut s, "WRS DM65534.U 2 1 1"), "E0");
+        assert_eq!(run(&mut s, "RD R199915"), "0");
+        assert_eq!(run(&mut s, "RD R200000"), "E0");
+        assert_eq!(run(&mut s, "RDS R199915 2"), "E0");
+        assert_eq!(run(&mut s, "RD MR399915"), "0");
+        assert_eq!(run(&mut s, "RD MR400000"), "E0");
+        assert_eq!(run(&mut s, "RD LR99915"), "0");
+        assert_eq!(run(&mut s, "RD LR100000"), "E0");
+        // 点数: ビット・16 bit 1..=1000、32 bit 1..=500。
+        assert_eq!(run(&mut s, "RDS DM0.U 1000").split(' ').count(), 1000);
+        assert_eq!(run(&mut s, "RDS DM0.U 1001"), "E1");
+        assert_eq!(run(&mut s, "RDS R0 1000").split(' ').count(), 1000);
+        assert_eq!(run(&mut s, "RDS R0 1001"), "E1");
+        assert_eq!(run(&mut s, "RDS DM0.L 500").split(' ').count(), 500);
+        assert_eq!(run(&mut s, "RDS DM0.L 501"), "E1");
+        assert_eq!(run(&mut s, "RDS DM0.D 501"), "E1");
+        // 巨大な点数で大きな確保をしない（以前は 4G 点ぶん確保しようとした）。
+        assert_eq!(run(&mut s, "RDS DM0.U 4294967295"), "E1");
+        assert_eq!(run(&mut s, "RDS DM0.U 99999999999"), "E1");
+    }
+
+    #[test]
+    fn write_data_may_be_zero_suppressed_or_plus_signed() {
+        let mut s = State::default();
+        assert_eq!(run(&mut s, "WRS DM0.U 3 +1 00002 3"), "OK");
+        assert_eq!(run(&mut s, "RDS DM0.U 3"), "00001 00002 00003");
+        assert_eq!(run(&mut s, "WR DM0.L +0000000005"), "OK");
+        assert_eq!(run(&mut s, "RD DM0.L"), "+0000000005");
+        assert_eq!(run(&mut s, "WR DM0.S -00001"), "OK");
+        assert_eq!(run(&mut s, "RD DM0.S"), "-00001");
     }
 }
