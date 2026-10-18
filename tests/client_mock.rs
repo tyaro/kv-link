@@ -737,3 +737,29 @@ async fn command_log_is_a_bounded_ring_but_requests_keep_counting() {
     assert!(mock.received_commands().is_empty());
     assert_eq!(mock.request_count(), 7);
 }
+
+/// `set_words` は要求の処理に対して原子的: 下位・上位ワードが連動する値を書き続ける
+/// 書き手に対し、`u32` の読み出しが新下位 + 旧上位の混在を一度も観測しない。
+#[tokio::test]
+async fn set_words_is_atomic_against_u32_reads() {
+    const N: u16 = 2000;
+    let (mock, mut c) = setup().await;
+    let mock = std::sync::Arc::new(mock);
+    let dm10 = a("DM10");
+    mock.set_words(&dm10, &[0, 0]);
+
+    let writer = {
+        let mock = std::sync::Arc::clone(&mock);
+        tokio::spawn(async move {
+            for k in 0..N {
+                mock.set_words(&dm10, &[k, k]);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    for _ in 0..500 {
+        let v = c.read::<u32>(&dm10).await.unwrap();
+        assert_eq!(v & 0xFFFF, v >> 16, "混在した値を観測: {v:#010X}");
+    }
+    writer.await.unwrap();
+}

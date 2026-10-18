@@ -82,10 +82,9 @@ fn addr(s: &str) -> Address {
 
 /// 32 bit 値を下位ワードが先（指定番号が下位、docs/protocol.md P-12）で置く。
 fn set_u32(mock: &MockServer, base: &str, v: u32) {
-    let lo = addr(base);
-    let hi = lo.offset(1).expect("上位ワード");
-    mock.set_word(&lo, v as u16);
-    mock.set_word(&hi, (v >> 16) as u16);
+    // 両ワードを 1 回のロックで書く。別々に書くと同時の RDS が新下位 + 旧上位を
+    // 読みうるが、実機は偶数番地の 32 bit 値の両ワードを同時に保証する（P-32）。
+    mock.set_words(&addr(base), &[v as u16, (v >> 16) as u16]);
 }
 
 #[tokio::main]
@@ -123,16 +122,13 @@ async fn main() -> ExitCode {
     println!("  （デモ用デバイスへの書き込みは次の tick で上書きされる。その他は普通のメモリ）");
 
     let dm0 = addr("DM0");
-    let dm10 = addr("DM10");
-    let dm11 = addr("DM11");
     let r000 = addr("R000");
     let mr000 = addr("MR000");
 
     // 初期値（tick 0 の値）。--tick-ms 0 のときはこのまま変わらない。
     mock.set_word(&dm0, 0);
     set_u32(&mock, "DM2", 0);
-    mock.set_word(&dm10, 0);
-    mock.set_word(&dm11, 0);
+    set_u32(&mock, "DM10", 0);
     mock.set_bit(&r000, false);
     mock.set_bit(&mr000, true);
 
@@ -162,10 +158,10 @@ async fn main() -> ExitCode {
                 mock.set_word(&dm0, n as u16);
                 set_u32(&mock, "DM2", n as u32);
                 // 周期 60 tick の正弦波。f32 のビット列を下位ワードが先で置く（P-26）。
-                let v = (n as f32 * std::f32::consts::TAU / 60.0).sin() * 100.0;
-                let bits = v.to_bits();
-                mock.set_word(&dm10, bits as u16);
-                mock.set_word(&dm11, (bits >> 16) as u16);
+                // 位相は n % 60 から作る（n を直接 f32 にすると 2^24 tick 以降で精度を失う）。
+                let phase = (n % 60) as f32;
+                let v = (phase * std::f32::consts::TAU / 60.0).sin() * 100.0;
+                set_u32(&mock, "DM10", v.to_bits());
                 let on = n % 2 == 1;
                 mock.set_bit(&r000, on);
                 mock.set_bit(&mr000, !on);

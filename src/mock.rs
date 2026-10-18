@@ -262,6 +262,30 @@ impl MockServer {
             .insert((addr.device(), addr.number()), value);
     }
 
+    /// 連続するワードを `start` から順に設定する。`start` がビットデバイスなら、
+    /// または範囲がデバイス番号の上限を超えるなら panic（何も書かない）。
+    ///
+    /// 全ワードを 1 回のロックで書くので、要求の処理に対して原子的。要求の処理側
+    /// （`execute`）も 1 行の実行を通して 1 回のロックで行う（RDS の複数ワードの
+    /// 読み出しも同様）ため、32 bit 値の下位・上位ワードを別々の `set_word` で
+    /// 書いたときのような「新下位 + 旧上位」の混在は観測されない。実機が偶数番地の
+    /// 32 bit 値の両ワードを同時に保証すること（docs/protocol.md P-32）の再現に使う。
+    pub fn set_words(&self, start: &Address, values: &[u16]) {
+        assert!(!start.device().is_bit(), "set_words needs a word device");
+        let keys: Vec<_> = (0..values.len())
+            .map(|i| {
+                let a = start
+                    .offset(u32::try_from(i).expect("点数が多すぎる"))
+                    .expect("set_words の範囲がデバイス番号の上限を超えている");
+                (a.device(), a.number())
+            })
+            .collect();
+        let mut s = lock(&self.state);
+        for (k, v) in keys.into_iter().zip(values) {
+            s.words.insert(k, *v);
+        }
+    }
+
     /// ワードを 1 つ読む（未設定は 0）。`addr` がビットデバイスなら panic。
     pub fn word(&self, addr: &Address) -> u16 {
         assert!(!addr.device().is_bit(), "word needs a word device");
