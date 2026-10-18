@@ -5,9 +5,14 @@
 //! 送って E0 を待つより、送らずに断るほうが原因が分かりやすく、接続にも触れない。
 //!
 //! 解析は大文字小文字を問わず、表示（＝送信する文字列）は大文字の正規形にする。
-//! 文法そのもの（接頭辞・ビット番号の表記）は未照合で、docs/protocol.md P-13・
-//! P-22・P-23 の表が正。デバイスごとの番号範囲は未照合なので検査しない
-//! （P-24、`protocol.rs` の TODO）。
+//! 文法（接頭辞・ビット番号の表記・ゼロサプレス）とデバイスごとの番号範囲は
+//! docs/protocol.md P-13・P-22〜P-24 の表が正。範囲外の番号を持つ [`Address`] は
+//! 作れない（構築・解析・[`Address::offset`] のどれもが範囲を検査する）ので、
+//! 「範囲内の `Address`」は型で保証される。
+//!
+//! `R` の上限は KV-8000 などの `R199915` を採っている。KV-7000 シリーズで CPU
+//! 機能バージョンが 2.2 以下の機種は実際には `R99915` までで、その間の番号は
+//! 送ってから PLC の `E0` で断られる（P-24）。
 
 use std::fmt;
 use std::str::FromStr;
@@ -55,6 +60,18 @@ impl DeviceType {
     pub const fn is_bit(self) -> bool {
         matches!(self, DeviceType::R | DeviceType::Mr | DeviceType::Lr)
     }
+
+    /// 最大デバイス番号（ワイヤ上の番号。ビットデバイスはチャネル × 100 +
+    /// ビットの形で、`R` なら `199915`）。最小はどれも 0。`[P-24]`
+    pub const fn max_number(self) -> u32 {
+        match self {
+            DeviceType::Dm => protocol::MAX_NUMBER_DM,
+            DeviceType::Em => protocol::MAX_NUMBER_EM,
+            DeviceType::R => protocol::MAX_NUMBER_R,
+            DeviceType::Mr => protocol::MAX_NUMBER_MR,
+            DeviceType::Lr => protocol::MAX_NUMBER_LR,
+        }
+    }
 }
 
 impl fmt::Display for DeviceType {
@@ -68,15 +85,25 @@ impl fmt::Display for DeviceType {
 #[error("invalid address {input:?}: {reason}")]
 pub struct AddressError {
     input: String,
-    reason: &'static str,
+    reason: String,
 }
 
 impl AddressError {
-    fn new(input: impl Into<String>, reason: &'static str) -> Self {
+    fn new(input: impl Into<String>, reason: impl Into<String>) -> Self {
         AddressError {
             input: input.into(),
-            reason,
+            reason: reason.into(),
         }
+    }
+
+    fn out_of_range(input: impl Into<String>, device: DeviceType) -> Self {
+        AddressError::new(
+            input,
+            format!(
+                "device number out of range for {device} (0..={})",
+                device.max_number()
+            ),
+        )
     }
 
     /// 断られた入力文字列。
@@ -95,7 +122,8 @@ impl From<AddressError> for KvError {
 ///
 /// ビットデバイスの番号はワイヤ上の表記どおり「チャネル × 100 + ビット」で
 /// 保持する（`R1015` なら `number() == 1015`、`channel() == Some(10)`、
-/// `bit() == Some(15)`）。ビット部が 16 以上（`R1016`）は作れない。
+/// `bit() == Some(15)`）。ビット部が 16 以上（`R1016`）や、デバイスの範囲
+/// （[`DeviceType::max_number`]）を超える番号は作れない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Address {
     device: DeviceType,
@@ -103,7 +131,8 @@ pub struct Address {
 }
 
 impl Address {
-    /// ワードデバイスのアドレスを作る。`device` がビットデバイスならエラー。
+    /// ワードデバイスのアドレスを作る。`device` がビットデバイス、または
+    /// 番号が範囲外ならエラー。
     pub fn word(device: DeviceType, number: u32) -> Result<Address, AddressError> {
         if device.is_bit() {
             return Err(AddressError::new(
@@ -111,11 +140,17 @@ impl Address {
                 "Address::word needs a word device",
             ));
         }
+        if number > device.max_number() {
+            return Err(AddressError::out_of_range(
+                format!("{device}{number}"),
+                device,
+            ));
+        }
         Ok(Address { device, number })
     }
 
-    /// ビットデバイスのアドレスを作る。`device` がワードデバイス、または
-    /// `bit` が 16 以上ならエラー。
+    /// ビットデバイスのアドレスを作る。`device` がワードデバイス、`bit` が
+    /// 16 以上、または番号が範囲外ならエラー。
     pub fn bit(device: DeviceType, channel: u32, bit: u32) -> Result<Address, AddressError> {
         let shown = || format!("{device}{channel}{bit:0w$}", w = protocol::BIT_FIELD_DIGITS);
         if !device.is_bit() {
@@ -130,7 +165,10 @@ impl Address {
         let number = channel
             .checked_mul(protocol::BIT_CHANNEL_MULTIPLIER)
             .and_then(|n| n.checked_add(bit))
-            .ok_or_else(|| AddressError::new(shown(), "device number too large"))?;
+            .ok_or_else(|| AddressError::out_of_range(shown(), device))?;
+        if number > device.max_number() {
+            return Err(AddressError::out_of_range(shown(), device));
+        }
         Ok(Address { device, number })
     }
 
@@ -159,9 +197,11 @@ impl Address {
     }
 
     /// `n` 点先のアドレス（ワードは +n ワード、ビットはビット 15 の次が
-    /// 次チャネルのビット 0）。モックの連続読み書きで使う。桁あふれは `None`。
+    /// 次チャネルのビット 0）。デバイスの範囲を超えれば `None`。
+    /// 連続アクセスが範囲に収まるかの検査とモックの連続読み書きで使う。
     ///
-    /// ビットの繰り上がり規則は未照合（docs/protocol.md P-13）。
+    /// ビットの繰り上がり規則はマニュアルの番号表記（チャネル + ビット
+    /// `00`〜`15`）からの推論（docs/protocol.md P-13）。
     pub fn offset(&self, n: u32) -> Option<Address> {
         if self.device.is_bit() {
             let ch = self.number / protocol::BIT_CHANNEL_MULTIPLIER;
@@ -173,10 +213,7 @@ impl Address {
             let bit = (linear % u64::from(protocol::BITS_PER_CHANNEL)) as u32;
             Address::bit(self.device, ch, bit).ok()
         } else {
-            Some(Address {
-                device: self.device,
-                number: self.number.checked_add(n)?,
-            })
+            Address::word(self.device, self.number.checked_add(n)?).ok()
         }
     }
 
@@ -211,9 +248,10 @@ impl FromStr for Address {
                 "device number must be decimal digits only",
             ));
         }
+        // ゼロサプレスしてよい（P-13・P-22）ので先頭の 0 は受け付ける。
         let number: u32 = digits
             .parse()
-            .map_err(|_| AddressError::new(s, "device number too large"))?;
+            .map_err(|_| AddressError::out_of_range(s, device))?;
         if device.is_bit() {
             Address::bit(
                 device,
@@ -281,8 +319,7 @@ mod tests {
         assert_eq!(a.channel(), None);
         assert_eq!(a.to_string(), "DM100");
         assert_eq!(ok("EM0").to_string(), "EM0");
-        // 範囲検査はしない（docs/protocol.md P-24）。
-        assert_eq!(ok("DM4294967295").number(), u32::MAX);
+        bad("DM4294967295");
         bad("DM4294967296");
     }
 
@@ -328,6 +365,44 @@ mod tests {
         assert_eq!(ok("R1014").offset(3), Some(ok("R1101")));
         assert_eq!(ok("R0").offset(16), Some(ok("R100")));
         assert_eq!(ok("DM10").offset(2), Some(ok("DM12")));
-        assert_eq!(ok("DM4294967295").offset(1), None);
+        // 範囲の端を超える offset は None。
+        assert_eq!(ok("DM65534").offset(0), Some(ok("DM65534")));
+        assert_eq!(ok("DM65534").offset(1), None);
+        assert_eq!(ok("DM0").offset(u32::MAX), None);
+        assert_eq!(ok("R199914").offset(1), Some(ok("R199915")));
+        assert_eq!(ok("R199915").offset(1), None);
+        assert_eq!(ok("LR99915").offset(1), None);
+        assert_eq!(ok("MR399900").offset(15), Some(ok("MR399915")));
+        assert_eq!(ok("MR399900").offset(16), None);
+    }
+
+    #[test]
+    fn device_number_ranges() {
+        // DM・EM: 0..=65534
+        assert_eq!(ok("DM0").number(), 0);
+        assert_eq!(ok("DM65534").number(), 65534);
+        bad("DM65535");
+        assert_eq!(ok("EM65534").number(), 65534);
+        bad("EM65535");
+        assert!(Address::word(DeviceType::Dm, 65534).is_ok());
+        assert!(Address::word(DeviceType::Em, 65535).is_err());
+        // R: 00000..=199915
+        assert_eq!(ok("R199915").to_string(), "R199915");
+        bad("R199916"); // ビット部 16
+        bad("R200000");
+        assert!(Address::bit(DeviceType::R, 1999, 15).is_ok());
+        assert!(Address::bit(DeviceType::R, 2000, 0).is_err());
+        // MR: 00000..=399915
+        assert_eq!(ok("MR399915").to_string(), "MR399915");
+        bad("MR400000");
+        // LR: 00000..=99915
+        assert_eq!(ok("LR99915").to_string(), "LR99915");
+        bad("LR100000");
+        // ゼロサプレスしない（桁を詰めた）表記も同じ番号。
+        assert_eq!(ok("DM00200"), ok("DM200"));
+        assert_eq!(ok("R00005"), ok("R5"));
+        // 範囲外のメッセージは種別と上限を含む。
+        let e = "DM65535".parse::<Address>().unwrap_err().to_string();
+        assert!(e.contains("0..=65534"), "{e}");
     }
 }

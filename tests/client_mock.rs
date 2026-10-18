@@ -1,8 +1,9 @@
 //! モックサーバーに対する結合テスト（公開 API だけを使う）。
 //!
-//! モックは `protocol.rs` と同じ未照合の前提から作っているので、ここで確かめて
-//! いるのはクライアントの振る舞い（往復・分割受信・毒化・エラー分類）であって、
-//! プロトコルの正しさではない（docs/protocol.md）。
+//! モックはマニュアル（KV-XLE02 UM 13 章）の読み取りに合わせてあるが、同じ理解から
+//! 作っているので、ここで確かめているのはクライアントの振る舞い（往復・分割受信・
+//! 毒化・エラー分類・送る前の検査）とマニュアルの例の再現であって、実機での
+//! 正しさではない（docs/protocol.md「実機確認」）。
 
 use std::time::Duration;
 
@@ -96,7 +97,7 @@ async fn roundtrip_every_type_many() {
         [i32::MIN, -1, i32::MAX]
     );
 
-    // ビット 15 の次は次チャネルのビット 0（モックの仮定、docs/protocol.md P-13）。
+    // ビット 15 の次は次チャネルのビット 0（番号表記からの推論、docs/protocol.md P-13）。
     c.write_many::<bool>(&a("R1014"), &[true, false, true])
         .await
         .unwrap();
@@ -296,6 +297,9 @@ async fn invalid_requests_never_reach_the_network_and_do_not_poison() {
         c.write::<i32>(&a("MR0"), 1).await.unwrap_err(),
         c.read_many::<u16>(&a("DM0"), 0).await.unwrap_err(),
         c.read_many::<i32>(&a("DM0"), 100_000).await.unwrap_err(),
+        c.read_many::<u16>(&a("DM0"), 1001).await.unwrap_err(),
+        c.read::<u32>(&a("DM65534")).await.unwrap_err(),
+        c.read::<u32>(&a("DM1")).await.unwrap_err(),
         c.write_many::<u16>(&a("DM0"), &[]).await.unwrap_err(),
         c.raw_command("").await.unwrap_err(),
         c.raw_command("RD DM0\rRD DM1").await.unwrap_err(),
@@ -315,8 +319,8 @@ async fn invalid_requests_never_reach_the_network_and_do_not_poison() {
     assert_eq!(c.read::<u16>(&a("DM0")).await.unwrap(), 0);
 }
 
-/// 点数が巨大で応答長の見積もり（乗算＋終端の加算）がオーバーフローしても、
-/// パニックも送信もせず `InvalidRequest` で断り、接続は保たれる。
+/// 点数が巨大でも、パニックも送信もせず（点数上限で）`InvalidRequest` で断り、
+/// 接続は保たれる。
 #[tokio::test]
 async fn huge_read_many_count_is_invalid_request_without_sending() {
     let (mock, mut c) = setup().await;
@@ -405,4 +409,285 @@ async fn connection_refused_is_io() {
         .await
         .unwrap_err();
     assert!(matches!(e, KvError::Io(_)), "{e:?}");
+}
+
+/// マニュアル（13-17〜13-23）の例のやり取りをモックで再現する。
+#[tokio::test]
+async fn manual_example_exchanges() {
+    let (mock, mut c) = setup().await;
+    // WRS DM200.S 3 +15025 -05400 200 → OK（マニュアルの表記のまま送る）。
+    assert_eq!(
+        c.raw_command("WRS DM200.S 3 +15025 -05400 200")
+            .await
+            .unwrap(),
+        "OK"
+    );
+    assert_eq!(
+        c.read_many::<i16>(&a("DM200"), 3).await.unwrap(),
+        [15025, -5400, 200]
+    );
+    // 同じ値をゼロサプレス・`+` 省略でも書ける。
+    assert_eq!(
+        c.raw_command("WRS DM200.S 3 +15025 -5400 200")
+            .await
+            .unwrap(),
+        "OK"
+    );
+
+    // RDS DM200.S 3 → +15025 -25400 +00000
+    c.write_many::<i16>(&a("DM200"), &[15025, -25400, 0])
+        .await
+        .unwrap();
+    assert_eq!(
+        c.raw_command("RDS DM200.S 3").await.unwrap(),
+        "+15025 -25400 +00000"
+    );
+    assert_eq!(
+        c.read_many::<i16>(&a("DM200"), 3).await.unwrap(),
+        [15025, -25400, 0]
+    );
+
+    // WRS R100 4 1 0 1 0 → OK、RDS R100 4 → 1 0 1 0
+    c.write_many::<bool>(&a("R100"), &[true, false, true, false])
+        .await
+        .unwrap();
+    assert_eq!(c.raw_command("RDS R100 4").await.unwrap(), "1 0 1 0");
+    assert_eq!(
+        c.read_many::<bool>(&a("R100"), 4).await.unwrap(),
+        [true, false, true, false]
+    );
+    assert_eq!(
+        mock.received_commands(),
+        [
+            "WRS DM200.S 3 +15025 -05400 200",
+            "RDS DM200.S 3",
+            "WRS DM200.S 3 +15025 -5400 200",
+            "WRS DM200.S 3 15025 -25400 0",
+            "RDS DM200.S 3",
+            "RDS DM200.S 3",
+            "WRS R100 4 1 0 1 0",
+            "RDS R100 4",
+            "RDS R100 4",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn device_range_boundaries() {
+    let (mock, mut c) = setup().await;
+    // 端の番号は読み書きできる。
+    c.write::<u16>(&a("DM65534"), 7).await.unwrap();
+    assert_eq!(c.read::<u16>(&a("DM65534")).await.unwrap(), 7);
+    assert_eq!(c.read::<u16>(&a("EM65534")).await.unwrap(), 0);
+    c.write::<bool>(&a("R199915"), true).await.unwrap();
+    assert!(c.read::<bool>(&a("R199915")).await.unwrap());
+    assert!(!c.read::<bool>(&a("MR399915")).await.unwrap());
+    assert!(!c.read::<bool>(&a("LR99915")).await.unwrap());
+    assert_eq!(
+        c.read_many::<bool>(&a("R199900"), 16).await.unwrap().len(),
+        16
+    );
+    let sent = mock.request_count();
+
+    // 範囲外のアドレスは作れない（InvalidRequest に変換される）。
+    for s in [
+        "DM65535", "EM65535", "R199916", "R200000", "MR400000", "LR100000",
+    ] {
+        let e: KvError = s.parse::<Address>().unwrap_err().into();
+        assert!(matches!(e, KvError::InvalidRequest(_)), "{s}: {e:?}");
+    }
+    // 端から始まって範囲を超えるアクセスは送らずに断る。
+    let cases = vec![
+        c.read::<u32>(&a("DM65534")).await.unwrap_err(),
+        c.write::<i32>(&a("EM65534"), 1).await.unwrap_err(),
+        c.read::<f32>(&a("DM65534")).await.unwrap_err(),
+        c.read_many::<u16>(&a("DM65534"), 2).await.unwrap_err(),
+        c.read_many::<bool>(&a("R199900"), 17).await.unwrap_err(),
+        c.write_many::<bool>(&a("LR99915"), &[true, true])
+            .await
+            .unwrap_err(),
+        c.read_many::<bool>(&a("MR399915"), 2).await.unwrap_err(),
+    ];
+    for e in &cases {
+        assert!(matches!(e, KvError::InvalidRequest(_)), "{e:?}");
+    }
+    assert_eq!(mock.request_count(), sent);
+    assert!(c.is_connected());
+
+    // モック自身も範囲外を E0 で断る（raw_command はライブラリの検査を通らない）。
+    match c.raw_command("RD DM65535").await {
+        Err(KvError::Device { code }) => assert_eq!(code, DeviceErrorCode::DeviceNumber),
+        other => panic!("{other:?}"),
+    }
+    match c.raw_command("RD DM65534.D").await {
+        Err(KvError::Device { code }) => assert_eq!(code, DeviceErrorCode::DeviceNumber),
+        other => panic!("{other:?}"),
+    }
+    assert!(c.is_connected());
+}
+
+#[tokio::test]
+async fn point_count_limits() {
+    let (mock, mut c) = setup().await;
+    assert_eq!(
+        c.read_many::<u16>(&a("DM0"), 1000).await.unwrap().len(),
+        1000
+    );
+    assert_eq!(
+        c.read_many::<i16>(&a("EM0"), 1000).await.unwrap().len(),
+        1000
+    );
+    assert_eq!(
+        c.read_many::<bool>(&a("MR0"), 1000).await.unwrap().len(),
+        1000
+    );
+    assert_eq!(c.read_many::<u32>(&a("DM0"), 500).await.unwrap().len(), 500);
+    assert_eq!(c.read_many::<i32>(&a("DM0"), 500).await.unwrap().len(), 500);
+    c.write_many::<u16>(&a("DM0"), &[1; 1000]).await.unwrap();
+    c.write_many::<u32>(&a("DM0"), &[2; 500]).await.unwrap();
+    let sent = mock.request_count();
+
+    let cases = vec![
+        c.read_many::<u16>(&a("DM0"), 1001).await.unwrap_err(),
+        c.read_many::<bool>(&a("R0"), 1001).await.unwrap_err(),
+        c.read_many::<u32>(&a("DM0"), 501).await.unwrap_err(),
+        c.read_many::<f32>(&a("DM0"), 501).await.unwrap_err(),
+        c.write_many::<i16>(&a("DM0"), &[0; 1001])
+            .await
+            .unwrap_err(),
+        c.write_many::<i32>(&a("DM0"), &[0; 501]).await.unwrap_err(),
+    ];
+    for e in &cases {
+        assert!(matches!(e, KvError::InvalidRequest(_)), "{e:?}");
+    }
+    assert_eq!(mock.request_count(), sent);
+
+    // モックも上限外の点数を断る（巨大な点数でも大きな確保をしない）。
+    for cmd in ["RDS DM0.U 1001", "RDS DM0.D 501", "RDS DM0.U 4294967295"] {
+        match c.raw_command(cmd).await {
+            Err(KvError::Device { code }) => assert_eq!(code, DeviceErrorCode::Command),
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+    assert!(c.is_connected());
+}
+
+#[tokio::test]
+async fn odd_start_32bit_is_rejected_without_sending() {
+    let (mock, mut c) = setup().await;
+    let cases = vec![
+        c.read::<u32>(&a("DM1")).await.unwrap_err(),
+        c.read::<i32>(&a("EM3")).await.unwrap_err(),
+        c.read::<f32>(&a("DM5")).await.unwrap_err(),
+        c.read_many::<u32>(&a("DM101"), 2).await.unwrap_err(),
+        c.write::<i32>(&a("DM7"), -1).await.unwrap_err(),
+        c.write::<f32>(&a("EM9"), 1.0).await.unwrap_err(),
+        c.write_many::<u32>(&a("DM11"), &[1, 2]).await.unwrap_err(),
+        c.write_many::<f32>(&a("DM13"), &[1.0]).await.unwrap_err(),
+    ];
+    for e in &cases {
+        match e {
+            KvError::InvalidRequest(m) => {
+                assert!(m.contains("even") && m.contains("13-33"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!e.is_connection_fatal());
+    }
+    assert_eq!(mock.request_count(), 0);
+    assert!(c.is_connected());
+    // 偶数番地なら通る。16 bit は奇数番地でよい。
+    c.write::<u32>(&a("DM2"), 70000).await.unwrap();
+    assert_eq!(c.read::<u32>(&a("DM2")).await.unwrap(), 70000);
+    assert_eq!(c.read::<u16>(&a("DM3")).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn f32_roundtrip() {
+    let (mock, mut c) = setup().await;
+    let values = [
+        1.5f32,
+        -2.25,
+        0.0,
+        -0.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MIN_POSITIVE,
+        f32::MAX,
+        f32::MIN,
+        -123.456,
+    ];
+    for v in values {
+        c.write::<f32>(&a("DM100"), v).await.unwrap();
+        let back = c.read::<f32>(&a("DM100")).await.unwrap();
+        assert_eq!(back.to_bits(), v.to_bits(), "{v}");
+    }
+    c.write_many::<f32>(&a("EM0"), &values).await.unwrap();
+    let back = c.read_many::<f32>(&a("EM0"), values.len()).await.unwrap();
+    for (v, b) in values.iter().zip(&back) {
+        assert_eq!(b.to_bits(), v.to_bits(), "{v}");
+    }
+    // NaN もビット列のまま往復する。
+    let nan = f32::from_bits(0xFFC0_1234);
+    c.write::<f32>(&a("DM0"), nan).await.unwrap();
+    assert_eq!(
+        c.read::<f32>(&a("DM0")).await.unwrap().to_bits(),
+        0xFFC0_1234
+    );
+
+    // 下位ワードが指定番号、上位ワードが次の番号（13-33）。1.0 = 0x3F80_0000。
+    c.write::<f32>(&a("DM10"), 1.0).await.unwrap();
+    assert_eq!(mock.word(&a("DM10")), 0x0000);
+    assert_eq!(mock.word(&a("DM11")), 0x3F80);
+    c.write::<f32>(&a("DM10"), -1.0).await.unwrap();
+    assert_eq!(c.read::<u32>(&a("DM10")).await.unwrap(), 0xBF80_0000);
+    assert!(mock
+        .received_commands()
+        .contains(&"WR DM10.D 3212836864".to_owned()));
+}
+
+#[tokio::test]
+async fn multi_digit_error_like_line_is_framing() {
+    let (mock, mut c) = setup().await;
+    // エラーコードは 1 桁だけ。`E10` はエラー応答ではなく、値として解釈できない。
+    mock.inject(Fault::Garbage(b"E10\r\n".to_vec()), 1);
+    let e = c.read::<u16>(&a("DM0")).await.unwrap_err();
+    assert!(matches!(e, KvError::Framing(_)), "{e:?}");
+    assert!(!c.is_connected());
+}
+
+#[tokio::test]
+async fn overlong_token_is_framing() {
+    let (mock, mut c) = setup().await;
+    mock.inject(Fault::Garbage(b"000001\r\n".to_vec()), 1);
+    let e = c.read::<u16>(&a("DM0")).await.unwrap_err();
+    assert!(matches!(e, KvError::Framing(_)), "{e:?}");
+    assert!(!c.is_connected());
+
+    // 短い（ゼロサプレスされた）トークンは受け付ける。
+    let (mock, mut c) = setup().await;
+    mock.inject(Fault::Garbage(b"-1 +2 3\r\n".to_vec()), 1);
+    assert_eq!(c.read_many::<i16>(&a("DM0"), 3).await.unwrap(), [-1, 2, 3]);
+    assert!(c.is_connected());
+}
+
+#[tokio::test]
+async fn injected_e4_and_e5_are_named_and_not_fatal() {
+    let (mock, mut c) = setup().await;
+    mock.inject(Fault::ErrorCode("E4".into()), 1);
+    match c.write_many::<u16>(&a("DM0"), &[1, 2]).await {
+        Err(KvError::Device { code }) => assert_eq!(code, DeviceErrorCode::WriteProhibited),
+        other => panic!("{other:?}"),
+    }
+    // 注入した WRS は実行されていない。
+    assert_eq!(mock.word(&a("DM0")), 0);
+    mock.inject(Fault::ErrorCode("E5".into()), 1);
+    match c.raw_command("M1").await {
+        Err(KvError::Device { code }) => {
+            assert_eq!(code, DeviceErrorCode::CpuError);
+            assert_eq!(code.as_str(), "E5");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(c.is_connected());
 }

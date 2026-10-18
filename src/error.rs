@@ -9,12 +9,13 @@ use std::fmt;
 
 use crate::protocol;
 
-/// PLC がエラー応答（`E` + 数字）で返したコード。
+/// PLC がエラー応答（`E` + 数字 1 桁）で返したコード。
 ///
-/// 既知のコードは名前付きの variant に、知らないコードは生の文字列のまま
-/// [`DeviceErrorCode::Unknown`] に入れる（知らないコードが来ても
+/// 既知のコード（マニュアル 13-32 の一覧: `E0`・`E1`・`E2`・`E4`・`E5`・`E6`）は
+/// 名前付きの variant に、一覧にない 1 桁のコード（`E3`・`E7`〜`E9`）は生の
+/// 文字列のまま [`DeviceErrorCode::Unknown`] に入れる（知らないコードが来ても
 /// フレーミング異常にはしない: 完全な 1 行が届いている以上、ストリームは
-/// 揃ったままだから）。コードの意味はすべて未照合（docs/protocol.md P-16〜P-21）。
+/// 揃ったままだから）。意味は docs/protocol.md P-15〜P-21。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceErrorCode {
     /// `E0` デバイス番号異常。
@@ -25,19 +26,19 @@ pub enum DeviceErrorCode {
     ProgramNotRegistered,
     /// `E4` 書き込み禁止。
     WriteProhibited,
-    /// `E5` ユニットエラー。
-    Unit,
-    /// `E6` コメントなし。
+    /// `E5` 本体エラー（CPU ユニットのエラーが解除されていない）。
+    CpuError,
+    /// `E6` コメントなし（コメントが登録されていない）。
     NoComment,
-    /// 上の表にないコード。`E` を含む生の文字列（例 `"E9"`）。
+    /// 上の一覧にない 1 桁のコード。`E` を含む生の文字列（例 `"E9"`）。
     Unknown(String),
 }
 
 impl DeviceErrorCode {
     /// 応答 1 行（終端を除いたもの）がエラー応答なら、そのコードを返す。
     ///
-    /// 文法は `E` + 数字 1〜[`protocol::MAX_ERROR_CODE_DIGITS`] 桁、それ以外の
-    /// 文字を含まないこと。エラー応答でなければ `None`（値や `OK` として
+    /// 文法は `E` + 数字ちょうど [`protocol::MAX_ERROR_CODE_DIGITS`] 桁（1 桁）、
+    /// それ以外の文字を含まないこと（`E10` はエラー応答ではない）。エラー応答でなければ `None`（値や `OK` として
     /// 呼び出し側が続けて解釈する）。
     pub fn parse(line: &str) -> Option<DeviceErrorCode> {
         let digits = line.strip_prefix(protocol::ERROR_PREFIX)?;
@@ -52,7 +53,7 @@ impl DeviceErrorCode {
             protocol::ERR_COMMAND => DeviceErrorCode::Command,
             protocol::ERR_PROGRAM_NOT_REGISTERED => DeviceErrorCode::ProgramNotRegistered,
             protocol::ERR_WRITE_PROHIBITED => DeviceErrorCode::WriteProhibited,
-            protocol::ERR_UNIT => DeviceErrorCode::Unit,
+            protocol::ERR_CPU_ERROR => DeviceErrorCode::CpuError,
             protocol::ERR_NO_COMMENT => DeviceErrorCode::NoComment,
             other => DeviceErrorCode::Unknown(other.to_owned()),
         })
@@ -65,7 +66,7 @@ impl DeviceErrorCode {
             DeviceErrorCode::Command => protocol::ERR_COMMAND,
             DeviceErrorCode::ProgramNotRegistered => protocol::ERR_PROGRAM_NOT_REGISTERED,
             DeviceErrorCode::WriteProhibited => protocol::ERR_WRITE_PROHIBITED,
-            DeviceErrorCode::Unit => protocol::ERR_UNIT,
+            DeviceErrorCode::CpuError => protocol::ERR_CPU_ERROR,
             DeviceErrorCode::NoComment => protocol::ERR_NO_COMMENT,
             DeviceErrorCode::Unknown(raw) => raw,
         }
@@ -78,8 +79,8 @@ impl DeviceErrorCode {
             DeviceErrorCode::Command => "command error",
             DeviceErrorCode::ProgramNotRegistered => "program not registered",
             DeviceErrorCode::WriteProhibited => "write prohibited",
-            DeviceErrorCode::Unit => "unit error",
-            DeviceErrorCode::NoComment => "no comment",
+            DeviceErrorCode::CpuError => "CPU unit error not cleared",
+            DeviceErrorCode::NoComment => "comment not registered",
             DeviceErrorCode::Unknown(_) => "unknown error code",
         }
     }
@@ -184,7 +185,10 @@ mod tests {
             DeviceErrorCode::parse("E4"),
             Some(DeviceErrorCode::WriteProhibited)
         );
-        assert_eq!(DeviceErrorCode::parse("E5"), Some(DeviceErrorCode::Unit));
+        assert_eq!(
+            DeviceErrorCode::parse("E5"),
+            Some(DeviceErrorCode::CpuError)
+        );
         assert_eq!(
             DeviceErrorCode::parse("E6"),
             Some(DeviceErrorCode::NoComment)
@@ -193,21 +197,20 @@ mod tests {
 
     #[test]
     fn unknown_error_codes_keep_the_raw_code() {
-        assert_eq!(
-            DeviceErrorCode::parse("E3"),
-            Some(DeviceErrorCode::Unknown("E3".into()))
-        );
-        assert_eq!(
-            DeviceErrorCode::parse("E99"),
-            Some(DeviceErrorCode::Unknown("E99".into()))
-        );
-        assert_eq!(DeviceErrorCode::parse("E99").unwrap().as_str(), "E99");
+        for raw in ["E3", "E7", "E8", "E9"] {
+            assert_eq!(
+                DeviceErrorCode::parse(raw),
+                Some(DeviceErrorCode::Unknown(raw.into()))
+            );
+            assert_eq!(DeviceErrorCode::parse(raw).unwrap().as_str(), raw);
+        }
     }
 
     #[test]
     fn non_error_lines_are_not_error_codes() {
         for line in [
-            "", "E", "OK", "E1A", "e1", " E1", "E1 ", "E100", "00001", "E-1",
+            "", "E", "OK", "E1A", "e1", " E1", "E1 ", "E10", "E99", "E00", "E100", "00001", "E-1",
+            "E+1",
         ] {
             assert_eq!(DeviceErrorCode::parse(line), None, "{line:?}");
         }

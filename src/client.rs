@@ -24,11 +24,16 @@ use crate::protocol;
 ///
 /// 16 KiB にした理由: (1) 終端を送ってこない相手（ゴミを流し続ける機器、
 /// 別プロトコルのポートにつないだ場合など）に対してメモリを有限に抑える、
-/// (2) 想定する正しい応答はこれより十分小さい（`i32` でも 1 点 12 バイト
-/// なので約 1,360 点まで入る）。上限に収まらない点数の読み出しは、送る前に
-/// `InvalidRequest` で断る（正しい応答で接続を失わないため）。
-/// RDS の点数上限が照合できたら（docs/protocol.md P-25）見直す。
+/// (2) 型付き API の正しい応答はこれより十分小さい。点数上限（1 要求で
+/// ビット・16 bit は 1000 点、32 bit は 500 点、docs/protocol.md P-25）と固定幅
+/// （P-08）から、最大でも `.S` × 1000 点の約 7 KB に収まる。これはコンパイル時に
+/// 検査しているので、型付き API の正しい応答が上限に当たって接続を失うことはない
+/// （以前の「応答が上限に収まるか」の実行時の事前検査は、点数上限の検査に
+/// 置き換えた）。`raw_command` の応答にも同じ上限が掛かる。
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+
+// 型付き API の最大の正しい応答が上限に収まること（収まらなければビルドが通らない）。
+const _: () = assert!(codec::MAX_TYPED_RESPONSE_BYTES <= MAX_RESPONSE_BYTES);
 
 /// 接続設定。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,9 +123,8 @@ impl KvClient {
     /// 含めて 1 行に複数のコマンドを詰めることを防ぐ）。違反は送らずに
     /// [`KvError::InvalidRequest`]。
     ///
-    /// 応答がエラー応答（`E` + 数字 1〜2 桁）なら [`KvError::Device`] を返す。
-    /// `.H` 形式の読み出しでは値とエラー応答が見分けにくい点に注意
-    /// （docs/protocol.md P-15）。
+    /// 応答がエラー応答（`E` + 数字 1 桁）なら [`KvError::Device`] を返す。
+    /// それ以外の応答の中身は検査しない（呼び出し側が解釈する）。
     pub async fn raw_command(&mut self, cmd: &str) -> Result<String, KvError> {
         if cmd.is_empty() || !cmd.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
             return Err(KvError::InvalidRequest(
@@ -133,6 +137,10 @@ impl KvClient {
     }
 
     /// 1 点読む（`RD`）。
+    ///
+    /// 型とデバイスの組み合わせ違い、範囲外（32 bit 型は 2 ワード目も含む）、
+    /// 32 bit 型の奇数番地は送らずに [`KvError::InvalidRequest`]
+    /// （[`crate::codec`] の「送る前の検査」）。
     pub async fn read<T: KvValue>(&mut self, addr: &Address) -> Result<T, KvError> {
         let cmd = codec::build_read::<T>(addr)?;
         let line = self.transact(&cmd).await?;
@@ -142,20 +150,19 @@ impl KvClient {
 
     /// `addr` から連続 `count` 点読む（`RDS`）。32 bit 型は 1 点 2 ワード。
     ///
-    /// `count == 0`、または応答が [`MAX_RESPONSE_BYTES`] に収まらない点数は
-    /// 送らずに [`KvError::InvalidRequest`]。
+    /// 点数（ビット・16 bit 型は 1〜1000、32 bit 型は 1〜500）、範囲、32 bit 型の
+    /// 奇数番地の違反は送らずに [`KvError::InvalidRequest`]。
     pub async fn read_many<T: KvValue>(
         &mut self,
         addr: &Address,
         count: usize,
     ) -> Result<Vec<T>, KvError> {
         let cmd = codec::build_read_many::<T>(addr, count)?;
-        codec::check_response_fits::<T>(count, MAX_RESPONSE_BYTES)?;
         let line = self.transact(&cmd).await?;
         self.poison_on_fatal(codec::parse_read_response::<T>(&line, count))
     }
 
-    /// 1 点書く（`WR`）。
+    /// 1 点書く（`WR`）。送る前の検査は [`KvClient::read`] と同じ。
     ///
     /// 要求を送った後の接続致命エラー（[`KvError::Timeout`]・[`KvError::Io`]・
     /// [`KvError::Framing`]。例: 壊れた応答・余分なバイト・終端なし）は結果不明
@@ -167,7 +174,8 @@ impl KvClient {
         self.poison_on_fatal(codec::parse_write_response(&line))
     }
 
-    /// `addr` から連続して `values` を書く（`WRS`）。空なら送らずに
+    /// `addr` から連続して `values` を書く（`WRS`）。点数・範囲・奇数番地の
+    /// 検査は [`KvClient::read_many`] と同じで、違反（空を含む）は送らずに
     /// [`KvError::InvalidRequest`]。
     ///
     /// 要求を送った後の接続致命エラー（[`KvError::Timeout`]・[`KvError::Io`]・
