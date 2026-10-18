@@ -315,6 +315,20 @@ async fn invalid_requests_never_reach_the_network_and_do_not_poison() {
     assert_eq!(c.read::<u16>(&a("DM0")).await.unwrap(), 0);
 }
 
+/// 点数が巨大で応答長の見積もり（乗算＋終端の加算）がオーバーフローしても、
+/// パニックも送信もせず `InvalidRequest` で断り、接続は保たれる。
+#[tokio::test]
+async fn huge_read_many_count_is_invalid_request_without_sending() {
+    let (mock, mut c) = setup().await;
+    let e = c
+        .read_many::<bool>(&a("R0"), usize::MAX / 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, KvError::InvalidRequest(_)), "{e:?}");
+    assert!(c.is_connected());
+    assert_eq!(mock.request_count(), 0);
+}
+
 #[tokio::test]
 async fn closed_client_returns_not_connected() {
     let (mock, mut c) = setup().await;
@@ -355,12 +369,14 @@ async fn faults_apply_to_the_next_n_requests_in_order() {
 async fn unsolicited_bytes_before_next_request_are_framing() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    // クライアントの write 完了後にだけ余分なバイトを送る（時間差に頼らない）。
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel::<()>();
     let peer = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 64];
         let _ = s.read(&mut buf).await.unwrap();
         s.write_all(b"OK\r\n").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        written_rx.await.unwrap();
         s.write_all(b"00042\r\n").await.unwrap();
         // 相手が読むまで接続を保つ。
         let _ = s.read(&mut buf).await;
@@ -368,7 +384,9 @@ async fn unsolicited_bytes_before_next_request_are_framing() {
 
     let mut c = KvClient::connect(addr, fast_config()).await.unwrap();
     c.write::<u16>(&a("DM0"), 1).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    written_tx.send(()).unwrap();
+    // 余分なバイトが届くのを待つ。
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let e = c.read::<u16>(&a("DM0")).await.unwrap_err();
     assert!(matches!(e, KvError::Framing(_)), "{e:?}");
     assert!(!c.is_connected());

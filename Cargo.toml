@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["net", "io-util", "time"] }
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "rt-multi-thread", "sync"] }
 
 # モックに対する結合テストは公開 API だけを使い、mock feature が要る。
 # `cargo test`（feature なし）ではビルド対象から外れ、`cargo test --all-features` で走る。

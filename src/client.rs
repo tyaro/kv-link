@@ -157,8 +157,10 @@ impl KvClient {
 
     /// 1 点書く（`WR`）。
     ///
-    /// [`KvError::Timeout`]・[`KvError::Io`] は結果不明（書けたかどうか分からない）。
-    /// このメソッドは再送しない。
+    /// 要求を送った後の接続致命エラー（[`KvError::Timeout`]・[`KvError::Io`]・
+    /// [`KvError::Framing`]。例: 壊れた応答・余分なバイト・終端なし）は結果不明
+    /// （書けたかどうか分からない）。成功扱いにせず、このメソッドは再送しない。
+    /// [`KvError::InvalidRequest`]・[`KvError::NotConnected`] は何も送っていない。
     pub async fn write<T: KvValue>(&mut self, addr: &Address, value: T) -> Result<(), KvError> {
         let cmd = codec::build_write(addr, value)?;
         let line = self.transact(&cmd).await?;
@@ -168,8 +170,10 @@ impl KvClient {
     /// `addr` から連続して `values` を書く（`WRS`）。空なら送らずに
     /// [`KvError::InvalidRequest`]。
     ///
-    /// [`KvError::Timeout`]・[`KvError::Io`] は結果不明（一部だけ書けた可能性も
-    /// 含む）。このメソッドは再送しない。
+    /// 要求を送った後の接続致命エラー（[`KvError::Timeout`]・[`KvError::Io`]・
+    /// [`KvError::Framing`]。例: 壊れた応答・余分なバイト・終端なし）は結果不明
+    /// （一部だけ書けた可能性も含む）。成功扱いにせず、このメソッドは再送しない。
+    /// [`KvError::InvalidRequest`]・[`KvError::NotConnected`] は何も送っていない。
     pub async fn write_many<T: KvValue>(
         &mut self,
         addr: &Address,

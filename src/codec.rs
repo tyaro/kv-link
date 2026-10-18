@@ -164,7 +164,7 @@ pub(crate) fn check_response_fits<T: KvValue>(
 ) -> Result<(), KvError> {
     let worst = count
         .checked_mul(T::MAX_TOKEN_LEN + 1)
-        .map(|n| n + protocol::RESPONSE_TERMINATOR.len());
+        .and_then(|n| n.checked_add(protocol::RESPONSE_TERMINATOR.len()));
     match worst {
         Some(n) if n <= max_line_len => Ok(()),
         _ => Err(KvError::InvalidRequest(format!(
@@ -285,6 +285,7 @@ pub fn parse_write_response(line: &str) -> Result<(), KvError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::sealed::Codec;
 
     fn addr(s: &str) -> Address {
         s.parse().unwrap()
@@ -345,6 +346,14 @@ mod tests {
         assert!(check_response_fits::<i32>(10, 16 * 1024).is_ok());
         assert!(check_response_fits::<i32>(100_000, 16 * 1024).is_err());
         assert!(check_response_fits::<u16>(usize::MAX, 16 * 1024).is_err());
+        // checked_mul は成功するが終端の加算でオーバーフローする境界も、
+        // パニックも素通りもせず InvalidRequest で断る。
+        for r in [
+            check_response_fits::<bool>(usize::MAX / 2, 16 * 1024),
+            check_response_fits::<i16>(usize::MAX / (<i16 as Codec>::MAX_TOKEN_LEN + 1), 16 * 1024),
+        ] {
+            assert!(matches!(r, Err(KvError::InvalidRequest(_))), "{r:?}");
+        }
         // 境界: 11 桁 + 空白 = 12 バイト/点、終端 2 バイト。
         assert!(check_response_fits::<i32>(10, 122).is_ok());
         assert!(check_response_fits::<i32>(10, 121).is_err());
