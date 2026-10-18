@@ -1,6 +1,7 @@
 //! テスト用のモック TCP サーバー（feature `mock`）。
 //!
-//! `127.0.0.1:0` で待ち受け、メモリ上のワード・ビット領域に対して
+//! 既定では `127.0.0.1:0` で待ち受け（[`MockServer::start_on`] で任意のアドレスにも
+//! できる。常駐する疑似 KV は examples/kv-sim.rs）、メモリ上のワード・ビット領域に対して
 //! `RD`・`RDS`・`WR`・`WRS` を実装する。加えて、次の N 要求に対して
 //! 障害を注入できる（[`Fault`]: エラーコード・遅延・分割送信・ゴミ・終端後の
 //! 余分なバイト・無応答・切断）。
@@ -90,13 +91,47 @@ pub enum Fault {
     Close,
 }
 
-#[derive(Default)]
+/// 受信コマンドの記録の既定の上限（[`MockServer::set_command_log_capacity`]）。
+const DEFAULT_COMMAND_LOG_CAPACITY: usize = 10_000;
+
 struct State {
     words: HashMap<(DeviceType, u32), u16>,
     bits: HashMap<(DeviceType, u32), bool>,
     faults: VecDeque<Fault>,
     connections: usize,
-    commands: Vec<String>,
+    /// 直近の要求だけを残す有界リング。常駐させる疑似 KV（examples/kv-sim.rs）で
+    /// 無制限に溜めてメモリを食わないため。
+    commands: VecDeque<String>,
+    command_log_capacity: usize,
+    /// 受け取った要求の総数。記録が溢れて捨てても減らない。
+    requests: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            words: HashMap::new(),
+            bits: HashMap::new(),
+            faults: VecDeque::new(),
+            connections: 0,
+            commands: VecDeque::new(),
+            command_log_capacity: DEFAULT_COMMAND_LOG_CAPACITY,
+            requests: 0,
+        }
+    }
+}
+
+impl State {
+    fn record_command(&mut self, line: String) {
+        self.requests += 1;
+        if self.command_log_capacity == 0 {
+            return;
+        }
+        while self.commands.len() >= self.command_log_capacity {
+            self.commands.pop_front();
+        }
+        self.commands.push_back(line);
+    }
 }
 
 /// モックサーバー。drop すると待ち受けを止める（張られている接続は
@@ -129,7 +164,18 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 impl MockServer {
     /// `127.0.0.1:0` で待ち受けを始める。tokio のランタイム内で呼ぶこと。
     pub async fn start() -> std::io::Result<MockServer> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        Self::start_on("127.0.0.1:0").await
+    }
+
+    /// 指定したアドレスで待ち受けを始める（常駐する疑似 KV 用。examples/kv-sim.rs）。
+    /// tokio のランタイム内で呼ぶこと。
+    ///
+    /// 接続は何本でも受け付ける。実機のユニットは TCP ソケットが 15 本で Modbus
+    /// サーバ機能・MC/SLMP と共用だが（docs/protocol.md 利用側への注記）、モックは
+    /// その上限を再現しない。認証も無いので、ループバック以外に bind するときは
+    /// 同じネットワークの誰からでも読み書きできることに注意する。
+    pub async fn start_on(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<MockServer> {
+        let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let state = Arc::new(Mutex::new(State::default()));
         let accept_state = Arc::clone(&state);
@@ -170,14 +216,42 @@ impl MockServer {
     }
 
     /// これまでに受け取った要求（終端まで揃ったコマンド）の数。障害を注入した
-    /// 要求も数える。
+    /// 要求も数える。コマンドの記録が上限で捨てた分も数える。
     pub fn request_count(&self) -> usize {
-        lock(&self.state).commands.len()
+        lock(&self.state).requests
     }
 
-    /// 受け取ったコマンド（終端を除く）を受信順に返す。
+    /// 受け取ったコマンド（終端を除く）を受信順に返す。記録は直近
+    /// [`set_command_log_capacity`](Self::set_command_log_capacity) 件までの有界リングで
+    /// （既定 10,000 件）、それより古いものは捨てられている。総数は
+    /// [`request_count`](Self::request_count)。
     pub fn received_commands(&self) -> Vec<String> {
-        lock(&self.state).commands.clone()
+        lock(&self.state).commands.iter().cloned().collect()
+    }
+
+    /// コマンドの記録の上限を設定する（既定 10,000。0 なら記録しない）。常駐させる
+    /// と記録が無制限に増えてメモリを食うので有界にしている。上限を下げたときは
+    /// 古いものから捨てる。
+    pub fn set_command_log_capacity(&self, capacity: usize) {
+        let mut s = lock(&self.state);
+        s.command_log_capacity = capacity;
+        while s.commands.len() > capacity {
+            s.commands.pop_front();
+        }
+    }
+
+    /// 要求の通し番号 `cursor`（`request_count` と同じ数え方。最初は 0）以降に
+    /// 受け取ったコマンドを返す。戻り値は (コマンド, 次に渡す cursor, 記録から
+    /// 溢れて取りこぼした数)。ログ表示などの追っかけ用で、`cursor` を持ち回って
+    /// 繰り返し呼ぶ。数えと取り出しを 1 回のロックで行うので、間に届いた要求を
+    /// 落とさず二重にも返さない。
+    pub fn commands_since(&self, cursor: usize) -> (Vec<String>, usize, usize) {
+        let s = lock(&self.state);
+        let oldest = s.requests - s.commands.len();
+        let start = cursor.max(oldest);
+        let missed = start - cursor.min(start);
+        let cmds = s.commands.iter().skip(start - oldest).cloned().collect();
+        (cmds, s.requests, missed)
     }
 
     /// ワードを 1 つ設定する。`addr` がビットデバイスなら panic。
@@ -237,7 +311,7 @@ async fn serve(mut socket: TcpStream, state: Arc<Mutex<State>>) {
             }
             let fault = {
                 let mut s = lock(&state);
-                s.commands.push(line.clone());
+                s.record_command(line.clone());
                 s.faults.pop_front()
             };
             if !respond(&mut socket, &state, &line, fault).await {

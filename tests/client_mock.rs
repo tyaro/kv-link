@@ -691,3 +691,49 @@ async fn injected_e4_and_e5_are_named_and_not_fatal() {
     }
     assert!(c.is_connected());
 }
+
+#[tokio::test]
+async fn start_on_binds_given_address_and_serves_concurrent_clients() {
+    // 8501 などの固定ポートは使わない（他のテストや実機と衝突する）。
+    let mock = MockServer::start_on("127.0.0.1:0").await.unwrap();
+    mock.set_word(&a("DM5"), 123);
+    mock.set_word(&a("DM6"), 456);
+
+    let mut c1 = KvClient::connect(mock.addr(), fast_config()).await.unwrap();
+    let mut c2 = KvClient::connect(mock.addr(), fast_config()).await.unwrap();
+    // 2 本とも張ったままで、交互に問い合わせても取り違えない。
+    assert_eq!(c1.read::<u16>(&a("DM5")).await.unwrap(), 123);
+    assert_eq!(c2.read::<u16>(&a("DM6")).await.unwrap(), 456);
+    c1.write::<u16>(&a("DM7"), 9).await.unwrap();
+    assert_eq!(c2.read::<u16>(&a("DM7")).await.unwrap(), 9);
+    assert_eq!(mock.connection_count(), 2);
+}
+
+#[tokio::test]
+async fn command_log_is_a_bounded_ring_but_requests_keep_counting() {
+    let (mock, mut c) = setup().await;
+    mock.set_command_log_capacity(3);
+    for i in 0..5u16 {
+        c.write::<u16>(&a("DM0"), i).await.unwrap();
+    }
+    assert_eq!(mock.request_count(), 5);
+    assert_eq!(
+        mock.received_commands(),
+        ["WR DM0.U 2", "WR DM0.U 3", "WR DM0.U 4"]
+    );
+
+    // 追っかけ: 取りこぼし（溢れた分）と新着を数え間違えない。
+    let (cmds, next, missed) = mock.commands_since(0);
+    assert_eq!((cmds.len(), next, missed), (3, 5, 2));
+    let (cmds, next2, missed) = mock.commands_since(next);
+    assert_eq!((cmds.len(), next2, missed), (0, 5, 0));
+    c.read::<u16>(&a("DM0")).await.unwrap();
+    let (cmds, next3, missed) = mock.commands_since(next2);
+    assert_eq!((cmds, next3, missed), (vec!["RD DM0.U".to_owned()], 6, 0));
+
+    // 0 なら記録しないが、数えは続く。
+    mock.set_command_log_capacity(0);
+    c.read::<u16>(&a("DM0")).await.unwrap();
+    assert!(mock.received_commands().is_empty());
+    assert_eq!(mock.request_count(), 7);
+}

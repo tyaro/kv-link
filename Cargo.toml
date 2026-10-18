@@ -23,10 +23,17 @@ tokio = { version = "1", features = ["net", "io-util", "time"] }
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "rt-multi-thread", "sync", "signal"] }
 
 # モックに対する結合テストは公開 API だけを使い、mock feature が要る。
 # `cargo test`（feature なし）ではビルド対象から外れ、`cargo test --all-features` で走る。
 [[test]]
 name = "client_mock"
+required-features = ["mock"]
+
+# 疑似 KV（常駐するモック。README「疑似 KV（kv-sim）」）。モックが要る。
+# `signal` は Ctrl-C で止めるためで、dev-dependencies にだけ足す（ライブラリ本体の
+# 依存は増やさない）。
+[[example]]
+name = "kv-sim"
 required-features = ["mock"]
