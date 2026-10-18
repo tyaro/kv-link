@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # stable を入れるが、実際に使われるのは rust-toolchain.toml のピン
+      # （rustup の解決順序でリポジトリ直下のファイルが default より優先される）。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --all-features
+      - name: cargo test --doc
+        run: cargo test --doc --all-features
+      - name: cargo build (mock feature off)
+        run: cargo build --no-default-features
