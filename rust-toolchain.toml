@@ -1,0 +1,13 @@
+# banto-industrial（kv-link の利用側）と同じバージョンにピン留めする。
+#
+# CI（.github/workflows/ci.yml）は `dtolnay/rust-toolchain@stable` で stable を
+# 入れるが、rustup のツールチェイン解決順序は
+# 「RUSTUP_TOOLCHAIN > +toolchain > ディレクトリ override > rust-toolchain(.toml)
+# > rustup default」なので、リポジトリ直下のこのファイルが `rustup default` より
+# 優先され、実際の cargo 呼び出しはここで指定したバージョンになる
+# （banto-industrial の rust-toolchain.toml と同じ仕掛け）。
+#
+# 更新は banto-industrial 側のピン更新に合わせ、意図したコミットで書き換える。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

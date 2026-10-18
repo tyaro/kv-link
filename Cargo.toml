@@ -1,0 +1,32 @@
+[package]
+name = "kv-link"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "MIT"
+description = "KEYENCE KV series PLC host link (上位リンク通信) client over Ethernet TCP, tokio async"
+repository = "https://github.com/tyaro/kv-link"
+readme = "README.md"
+keywords = ["plc", "keyence", "industrial", "tokio"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = []
+# テスト用のモック TCP サーバー（`kv_link::mock`）を公開する。spawn に tokio の
+# `rt` が要るので、それも一緒に有効にする。利用側（banto-industrial）は
+# dev-dependencies でだけこの feature を有効にする想定。
+mock = ["tokio/rt"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+# banto-industrial の workspace と同じメジャーに揃える（2 系）。
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "rt-multi-thread"] }
+
+# モックに対する結合テストは公開 API だけを使い、mock feature が要る。
+# `cargo test`（feature なし）ではビルド対象から外れ、`cargo test --all-features` で走る。
+[[test]]
+name = "client_mock"
+required-features = ["mock"]
