@@ -16,6 +16,10 @@ use crate::protocol;
 /// 文字列のまま [`DeviceErrorCode::Unknown`] に入れる（知らないコードが来ても
 /// フレーミング異常にはしない: 完全な 1 行が届いている以上、ストリームは
 /// 揃ったままだから）。意味は docs/protocol.md P-15〜P-21。
+///
+/// `#[non_exhaustive]` を **付けていない** のは意図的（[`KvError`] と同じ理由）: 新しい
+/// コードの名前付き variant を足すのは破壊的変更で、版を上げてタグを打つ。利用側の
+/// `match` が静かに `Unknown` 側へ流れず、コンパイルで壊れて気づけるようにするため。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceErrorCode {
     /// `E0` デバイス番号異常。

@@ -475,7 +475,14 @@ fn read_points(s: &State, addr: &Address, fmt: Option<DataFormat>, n: u32) -> Op
                     .get(&(a.device(), a.number()))
                     .copied()
                     .unwrap_or(false);
-                out.push(if v { "1" } else { "0" }.to_owned());
+                out.push(
+                    if v {
+                        protocol::BIT_ON
+                    } else {
+                        protocol::BIT_OFF
+                    }
+                    .to_owned(),
+                );
             }
             Some(f) => {
                 let a = addr.offset(i.checked_mul(f.words())?)?;
@@ -515,8 +522,8 @@ fn write_points(
         match fmt {
             None => {
                 let v = match *token {
-                    "0" => false,
-                    "1" => true,
+                    protocol::BIT_OFF => false,
+                    protocol::BIT_ON => true,
                     _ => return Err(e_cmd()),
                 };
                 bits.push((addr.offset(i).ok_or_else(e_dev)?, v));

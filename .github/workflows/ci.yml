@@ -24,7 +24,11 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo test
         run: cargo test --all-features
-      - name: cargo test --doc
-        run: cargo test --doc --all-features
-      - name: cargo build (mock feature off)
-        run: cargo build --no-default-features
+      # ライブラリ単体（mock feature だけ）で足りる tokio feature が揃っているかの確認。
+      # dev-dependencies の feature 統一に隠れた不足を拾う。
+      - name: cargo build (mock feature only)
+        run: cargo build --features mock
+      - name: cargo doc
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
