@@ -70,6 +70,12 @@ pub const ERR_NO_COMMENT: &str = "E6";
 /// （`0`/`1` の 1 バイト）。`[P-08]`
 pub const BIT_TOKEN_WIDTH: usize = 1;
 
+/// ビット形式の値 0（OFF）。形式指定なしのビットデバイスの読み出し応答と
+/// 書き込みの値に使う。`[P-14]`
+pub const BIT_OFF: &str = "0";
+/// ビット形式の値 1（ON）。`[P-14]`
+pub const BIT_ON: &str = "1";
+
 /// ビット形式・16 bit 形式（`.U`・`.S`・`.H`）の 1 要求あたりの最大点数。`[P-25]`
 pub const MAX_POINTS_16BIT: usize = 1000;
 /// 32 bit 形式（`.D`・`.L`）の 1 要求あたりの最大点数。`[P-25]`

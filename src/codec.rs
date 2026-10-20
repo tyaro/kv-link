@@ -137,13 +137,18 @@ impl sealed::Codec for bool {
     const FORMAT: Option<DataFormat> = None;
     fn parse_token(token: &str) -> Option<bool> {
         match token {
-            "0" => Some(false),
-            "1" => Some(true),
+            protocol::BIT_OFF => Some(false),
+            protocol::BIT_ON => Some(true),
             _ => None,
         }
     }
     fn encode(self) -> String {
-        if self { "1" } else { "0" }.to_owned()
+        if self {
+            protocol::BIT_ON
+        } else {
+            protocol::BIT_OFF
+        }
+        .to_owned()
     }
 }
 

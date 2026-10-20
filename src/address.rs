@@ -21,6 +21,11 @@ use crate::error::KvError;
 use crate::protocol;
 
 /// v0 で扱うデバイス種別。
+///
+/// `#[non_exhaustive]` を **付けていない** のは意図的（[`crate::KvError`] と同じ理由）:
+/// 利用側（banto のアダプター）の `match` を網羅にしておけば、デバイス（T・C・W・B など）を
+/// 足したときにコンパイルが壊れて気づける。variant の追加は破壊的変更として版を上げて
+/// タグを打つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceType {
     /// `DM` データメモリ（ワード）。

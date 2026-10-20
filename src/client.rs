@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::address::Address;
@@ -21,6 +21,9 @@ use crate::error::KvError;
 use crate::protocol;
 
 /// 応答 1 行（終端込み）の上限バイト数。ライブラリの方針で、プロトコルの事実ではない。
+///
+/// 受信バッファはこの値を超えない（1 回の読み出しを残りバイト数で切るので、
+/// 超過はなく、上限ちょうどの長さの応答までを受け付ける）。
 ///
 /// 16 KiB にした理由: (1) 終端を送ってこない相手（ゴミを流し続ける機器、
 /// 別プロトコルのポートにつないだ場合など）に対してメモリを有限に抑える、
@@ -125,6 +128,11 @@ impl KvClient {
     ///
     /// 応答がエラー応答（`E` + 数字 1 桁）なら [`KvError::Device`] を返す。
     /// それ以外の応答の中身は検査しない（呼び出し側が解釈する）。
+    ///
+    /// **応答サイズの事前検査は無い。** 型付き API は点数上限で応答が
+    /// [`MAX_RESPONSE_BYTES`] に収まることを保証するが、ここで大きな `RDS` などを
+    /// 生で送って応答が上限を超えると `Framing` になり、クライアントは毒化される。
+    /// 通常は型付き API（`read` / `read_many` / `write` / `write_many`）を使うこと。
     pub async fn raw_command(&mut self, cmd: &str) -> Result<String, KvError> {
         if cmd.is_empty() || !cmd.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
             return Err(KvError::InvalidRequest(
@@ -208,6 +216,11 @@ impl KvClient {
         let Some(stream) = self.stream.as_mut() else {
             return Err(KvError::NotConnected);
         };
+        // 頼んでいないバイトの検査は TcpStream 固有（`try_read`）なので、ジェネリックな
+        // `exchange` の外でここだけが行う。同期の検査なので期限の外に置いても挙動は同じ。
+        if let Err(e) = reject_unsolicited_bytes(stream) {
+            return self.poison_on_fatal(Err(e));
+        }
         let deadline = self.config.response_timeout;
         // 期限切れで内側の future は読み出しの途中で捨てられうるが、その場合は
         // 下で必ず毒化してソケットごと捨てるので、途中まで読んだストリームを
@@ -220,9 +233,14 @@ impl KvClient {
     }
 }
 
-/// 送信前の確認 → 送信 → 応答 1 行の受信。
-async fn exchange(stream: &mut TcpStream, cmd: &str) -> Result<String, KvError> {
-    reject_unsolicited_bytes(stream)?;
+/// 送信 → 応答 1 行の受信。
+///
+/// 実際の接続は `TcpStream` だが、分割受信の境界条件を決定的にテストするため
+/// `AsyncRead + AsyncWrite` に対してジェネリックにしている。
+async fn exchange<S>(stream: &mut S, cmd: &str) -> Result<String, KvError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut frame = Vec::with_capacity(cmd.len() + protocol::COMMAND_TERMINATOR.len());
     frame.extend_from_slice(cmd.as_bytes());
     frame.extend_from_slice(protocol::COMMAND_TERMINATOR);
@@ -255,12 +273,21 @@ fn reject_unsolicited_bytes(stream: &mut TcpStream) -> Result<(), KvError> {
 }
 
 /// 応答を終端 `\r\n` まで読み、終端を除いた 1 行を返す。
-async fn read_line(stream: &mut TcpStream) -> Result<String, KvError> {
+///
+/// 1 回の読み出しは「上限までの残り」を超えて読まないので、バッファは
+/// [`MAX_RESPONSE_BYTES`] を超えない（上限ちょうどの長さの応答は受け付け、
+/// 終端が上限内に現れなければ `Framing`）。
+async fn read_line<S>(stream: &mut S) -> Result<String, KvError>
+where
+    S: AsyncRead + Unpin,
+{
     let term = protocol::RESPONSE_TERMINATOR;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     let mut chunk = [0u8; 1024];
     loop {
-        let n = stream.read(&mut chunk).await?;
+        // ここに来るとき buf.len() < MAX_RESPONSE_BYTES（超えるなら下で打ち切る）。
+        let want = chunk.len().min(MAX_RESPONSE_BYTES - buf.len());
+        let n = stream.read(&mut chunk[..want]).await?;
         if n == 0 {
             return Err(KvError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -296,5 +323,145 @@ async fn read_line(stream: &mut TcpStream) -> Result<String, KvError> {
                 "no response terminator within {MAX_RESPONSE_BYTES} bytes"
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    /// 台本どおりのチャンクを 1 回の読み出しにつき 1 つずつ返す読み書きストリーム。
+    /// 実ソケットと違い、チャンクの切れ目が決定的（読み出し側のバッファが小さい
+    /// ときだけ、1 チャンクを複数回に分けて返す）。台本が尽きたら EOF。
+    struct Scripted {
+        chunks: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl Scripted {
+        fn new(chunks: &[&[u8]]) -> Self {
+            Scripted {
+                chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(mut c) = self.chunks.pop_front() {
+                let n = c.len().min(buf.remaining());
+                buf.put_slice(&c[..n]);
+                if n < c.len() {
+                    self.chunks.push_front(c.split_off(n));
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Scripted {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn line(chunks: &[&[u8]]) -> Result<String, KvError> {
+        read_line(&mut Scripted::new(chunks)).await
+    }
+
+    fn is_framing(r: Result<String, KvError>) -> bool {
+        matches!(r, Err(KvError::Framing(_)))
+    }
+
+    #[tokio::test]
+    async fn cr_and_lf_in_separate_reads() {
+        assert_eq!(line(&[b"OK\r", b"\n"]).await.unwrap(), "OK");
+    }
+
+    #[tokio::test]
+    async fn terminator_split_across_chunks_with_payload() {
+        assert_eq!(
+            line(&[b"0001", b"2 0000", b"3\r", b"\n"]).await.unwrap(),
+            "00012 00003"
+        );
+        // 1 バイトずつ届いても揃う。
+        let bytes: Vec<&[u8]> = b"12345\r\n".chunks(1).collect();
+        assert_eq!(line(&bytes).await.unwrap(), "12345");
+    }
+
+    #[tokio::test]
+    async fn extra_bytes_after_terminator_in_same_read_is_framing() {
+        assert!(is_framing(line(&[b"OK\r\nX"]).await));
+        assert!(is_framing(line(&[b"OK\r", b"\n\r\n"]).await));
+    }
+
+    #[tokio::test]
+    async fn no_terminator_within_cap_is_framing() {
+        let big = vec![b'1'; MAX_RESPONSE_BYTES + 1000];
+        assert!(is_framing(line(&[&big]).await));
+    }
+
+    #[tokio::test]
+    async fn cap_is_exact() {
+        // 終端込みでちょうど上限の応答は受け付ける。
+        let mut ok = vec![b'1'; MAX_RESPONSE_BYTES - 2];
+        ok.extend_from_slice(b"\r\n");
+        assert_eq!(line(&[&ok]).await.unwrap().len(), MAX_RESPONSE_BYTES - 2);
+        // 終端が上限の 1 バイト先になる応答は、1 回の読み出しが残りで切られるので
+        // 上限を超えて読まずに Framing。
+        let mut over = vec![b'1'; MAX_RESPONSE_BYTES - 1];
+        over.extend_from_slice(b"\r\n");
+        let mut s = Scripted::new(&[&over]);
+        assert!(is_framing(read_line(&mut s).await));
+        let left: usize = s.chunks.iter().map(Vec::len).sum();
+        assert_eq!(left, 1, "上限を超えて読んでいない");
+    }
+
+    #[tokio::test]
+    async fn non_printable_byte_is_framing() {
+        assert!(is_framing(line(&[b"O\x00K\r\n"]).await));
+        assert!(is_framing(line(&[b"OK\xff\r\n"]).await));
+    }
+
+    #[tokio::test]
+    async fn eof_before_terminator_is_io() {
+        assert!(matches!(line(&[b"OK"]).await, Err(KvError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn exchange_sends_command_with_terminator_over_duplex() {
+        use tokio::io::duplex;
+        let (mut client, mut server) = duplex(64);
+        let peer = tokio::spawn(async move {
+            let mut req = [0u8; 8];
+            server.read_exact(&mut req).await.unwrap();
+            server.write_all(b"OK\r").await.unwrap();
+            server.write_all(b"\n").await.unwrap();
+            req
+        });
+        let r = exchange(&mut client, "WR R100").await.unwrap();
+        assert_eq!(r, "OK");
+        // コマンド本体の後ろに CR だけが付く。
+        assert_eq!(&peer.await.unwrap(), b"WR R100\r");
     }
 }

@@ -30,9 +30,14 @@ banto-industrial の banto-hub から KV シリーズへつなぐワイヤ層（
 ## 開発規約
 
 - 検証: `cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` /
-  `cargo test --all-features` / `cargo test --doc --all-features` / `cargo build --no-default-features`。
+  `cargo test --all-features`（doctest を含む） / `cargo build`（feature なし） / `cargo build --features mock` /
+  `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`。
 - コミットメッセージは日本語・Conventional Commits 風（例: `feat: RDS の応答解析を追加`）。
 - 設計意図はクレートの `lib.rs` 冒頭やモジュール文書に書く（banto-industrial と同じ流儀）。
   コメントは「なぜ」を書く。
 - banto-industrial は git タグでこのクレートを参照する（`deny.toml` の `required-git-spec = "tag"`）。
   公開 API の破壊的変更（`KvError` の variant 追加を含む）は版を上げてタグを打つ。
+  `KvError`・`DeviceType`・`DeviceErrorCode` は意図的に `#[non_exhaustive]` にしていない
+  （banto のアダプターの `match` が網羅であり続け、variant を足すとコンパイルで壊れて
+  気づけるように）。デバイス（T・C・W・B など）やエラーコードの追加も同じく破壊的変更で、
+  版を上げてタグを打つ。
