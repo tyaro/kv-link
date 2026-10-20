@@ -24,6 +24,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo test
         run: cargo test --all-features
+      # 利用者の通常構成（feature なし、default = []）。上の clippy / test は --all-features
+      # なので、ここが無いと mock を外した構成の壊れに気づけない。
+      - name: cargo build (features off)
+        run: cargo build
       # ライブラリ単体（mock feature だけ）で足りる tokio feature が揃っているかの確認。
       # dev-dependencies の feature 統一に隠れた不足を拾う。
       - name: cargo build (mock feature only)

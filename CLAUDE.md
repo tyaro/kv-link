@@ -30,7 +30,7 @@ banto-industrial の banto-hub から KV シリーズへつなぐワイヤ層（
 ## 開発規約
 
 - 検証: `cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` /
-  `cargo test --all-features`（doctest を含む） / `cargo build --features mock` /
+  `cargo test --all-features`（doctest を含む） / `cargo build`（feature なし） / `cargo build --features mock` /
   `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`。
 - コミットメッセージは日本語・Conventional Commits 風（例: `feat: RDS の応答解析を追加`）。
 - 設計意図はクレートの `lib.rs` 冒頭やモジュール文書に書く（banto-industrial と同じ流儀）。
